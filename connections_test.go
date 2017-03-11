@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+func (ce *connector) disconnected() bool {
+	return ce.next == nil
+}
+
 func TestSimpleConnections(t *testing.T) {
 	cs := newConnections(100, 2*time.Second)
 	Assert(t, (cs.max == 100), "Expected max 100:", cs.max)

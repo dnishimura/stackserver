@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,12 +14,13 @@ const (
 	MaxPayloadSize = 127
 )
 
-var logger net.Conn
+var logger *log.Logger
 
 type Server struct {
 	chans       chan bool
 	stack       *stack
-	connections *Connections
+	connections *connections
+	clientcount int64
 }
 
 func New(maxConnections, stackSize int, timeout time.Duration) *Server {
@@ -30,18 +31,29 @@ func New(maxConnections, stackSize int, timeout time.Duration) *Server {
 	}
 }
 
-func (server *Server) Start(host string, port, logPort uint16) error {
+func (server *Server) Start(host string, port, logport uint) error {
 	var err error
-	syslogHost := fmt.Sprintf("%s:%d", host, logPort)
-	logger, err = net.Dial("udp", syslogHost)
-	fmt.Println("Start logger", syslogHost)
-	if err != nil {
-		fmt.Println("Error opening syslog", err)
+	log.SetPrefix("[StackServer] ")
+	log.SetFlags(log.Lmicroseconds)
+	if port < 1 || port > 65535 {
+		log.Fatal("Invalid port", port)
 	}
-	defer server.logClose()
+	if logport > 65535 {
+		log.Fatal("Invalid debug port", logport)
+	} else if logport > 0 {
+		syslogHost := fmt.Sprintf("%s:%d", host, logport)
+		udp, err := net.Dial("udp", syslogHost)
+		logger = log.New(udp, "[StackServer] ", log.Lmicroseconds)
+		if err != nil {
+			log.Println("Debug logging disabled.", err)
+		} else {
+			log.Println("Debug UDP port:", logport)
+		}
+	}
 
 	tcpHost := fmt.Sprintf("%s:%d", host, port)
-	fmt.Println("Start StackServer", tcpHost)
+	log.Println("StackServer starting.")
+	log.Println("Listening TCP:", tcpHost)
 	listener, err := net.Listen("tcp", tcpHost)
 	if err != nil {
 		log.Fatal(err)
@@ -50,16 +62,6 @@ func (server *Server) Start(host string, port, logPort uint16) error {
 	defer listener.Close()
 
 	server.log("Started")
-	/*
-		ticker := time.NewTicker(time.Millisecond)
-		defer ticker.Stop()
-		go func() {
-			for range ticker.C {
-				server.connections.scanClosed()
-			}
-		}()
-	*/
-
 	for {
 		conn, err := listener.Accept()
 		if err == nil && conn != nil {
@@ -70,19 +72,6 @@ func (server *Server) Start(host string, port, logPort uint16) error {
 	}
 
 	return nil
-}
-
-func (server *Server) log(line string, args ...interface{}) {
-	if logger != nil {
-		output := fmt.Sprintf(line, args...)
-		fmt.Fprintln(logger, "[StackServer]", output)
-	}
-}
-
-func (server *Server) logClose() {
-	if logger != nil {
-		logger.Close()
-	}
 }
 
 func (server *Server) push(c *connector, data []byte) error {
@@ -101,26 +90,27 @@ func (server *Server) pop(c *connector) ([]byte, error) {
 		return server.stack.pop()
 	case <-c.done:
 	}
+
 	return nil, connectionClosedError
 }
 
 func (server *Server) accept(c net.Conn) {
 	connector, err := server.connections.add(c)
 	if err == connectionsMaxError {
-		server.log("Server busy")
+		server.log("Server busy.")
+		server.log("Rejected: r:%v, l:%v", c.RemoteAddr(), c.LocalAddr())
 		c.Write([]byte{BusyResponse})
 		c.Close()
-
 		return
 	}
 
-	connector.log("Connection accepted: r:%v, s:%v", c.RemoteAddr(), c.LocalAddr())
+	connector.log("Accepted: r:%v, l:%v", c.RemoteAddr(), c.LocalAddr())
 	buf := make([]byte, 128, 128)
 	nread := 0
 	for {
 		n, err := c.Read(buf[nread:])
 		if err != nil {
-			connector.log("Connection quit: %v", err)
+			connector.log("Read: %v", err)
 			server.connections.remove(connector)
 			return
 		}
@@ -130,41 +120,36 @@ func (server *Server) accept(c net.Conn) {
 			return
 		}
 
-		if buf[0] != 0x80 && int(buf[0]) > MaxPayloadSize {
-			connector.log("Invalid payload header [%x]: %v", buf[0])
-			server.connections.remove(connector)
-			return
-		}
-
 		if request(buf).isPop() {
 			// only care about one byte for pop
 			buf = buf[:1]
 			break
 		}
 
-		if int(buf[0]) == nread-1 {
+		if int(buf[0]) <= nread-1 {
 			buf = buf[:int(buf[0])+1]
+			if int(buf[0]) < nread-1 {
+				connector.log("Ignoring %d extra bytes in payload", nread-1-int(buf[0]))
+			}
 			break
-		} else if int(buf[0]) < nread-1 {
-			connector.log("Dropping, payload too large")
-			server.connections.remove(connector)
-			return
 		}
 	}
 
-	connector.log("Read %d bytes: %x", nread, buf)
-	connector.waiting = true
+	connector.log("Read %d bytes, using %d bytes: %0x", nread, len(buf), buf)
 	go func() {
+		// Do a blocked read to watch connection. EOF means connection closed.
+		atomic.AddInt64(&server.clientcount, 1)
 		one := []byte{0x00}
 		var err error
 		for err == nil {
 			_, err = connector.netConn.Read(one)
-			if err == io.EOF {
-				connector.done <- true
-				connector.log("EOF")
-				return
+			if err != nil {
+				connector.done <- true // unblocks push or pop
+				connector.log("Closed: %v", err)
 			}
 		}
+		atomic.AddInt64(&server.clientcount, -1)
+		server.log("Num blocking clients: %d", server.clientcount)
 	}()
 
 	if request(buf).isPop() {
@@ -173,7 +158,7 @@ func (server *Server) accept(c net.Conn) {
 		if err == nil {
 			n, err := connector.writeall(data)
 			if err == nil {
-				connector.log("pop() %d bytes: %x", n, data)
+				connector.log("pop() resp %d bytes: %x", n, data)
 			} else {
 				connector.log("pop() write error: %v", err)
 			}
@@ -187,15 +172,21 @@ func (server *Server) accept(c net.Conn) {
 			resp := []byte{PushResponse}
 			n, err := connector.writeall([]byte{PushResponse})
 			if err == nil {
-				connector.log("push() %d bytes: %x", n, resp)
+				connector.log("push(%x) resp %d bytes: %x", buf, n, resp)
 			} else {
-				connector.log("push() write error: %v", err)
+				connector.log("push(%x) write error: %v", buf, err)
 			}
 		} else {
-			connector.log("push() error: %v", err)
+			connector.log("push(%x) error: %v", buf, err)
 		}
 	}
 
 	connector.log("Exiting")
 	server.connections.remove(connector)
+}
+
+func (server *Server) log(line string, args ...interface{}) {
+	if logger != nil {
+		logger.Println(fmt.Sprintf(line, args...))
+	}
 }

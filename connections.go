@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -30,7 +29,6 @@ type connector struct {
 	next      *connector
 	prev      *connector
 	timestamp time.Time
-	waiting   bool
 	done      chan bool
 }
 
@@ -38,19 +36,11 @@ func (ce *connector) duration() time.Duration {
 	return time.Since(ce.timestamp)
 }
 
-func (ce *connector) disconnect() {
-	ce.next.prev, ce.prev.next = ce.prev, ce.next
-	ce.prev, ce.next = nil, nil
-}
-
-func (ce *connector) disconnected() bool {
-	return ce.next == nil
-}
-
 func (ce *connector) read(data []byte) (int, error) {
 	if ce.netConn == nil {
 		return 0, nil
 	}
+
 	return ce.netConn.Read(data)
 }
 
@@ -67,25 +57,30 @@ func (ce *connector) writeall(data []byte) (int, error) {
 			return nwrite, err
 		}
 	}
+
 	return nwrite, nil
 }
 
 func (ce *connector) finish() error {
-	ce.disconnect()
-	err := ce.netConn.Close()
+	var err error
+	ce.next.prev, ce.prev.next = ce.prev, ce.next
+	ce.prev, ce.next = nil, nil
+
+	if ce.netConn != nil {
+		err = ce.netConn.Close()
+	}
 	ce.done <- true // Ensure connection is closed
+
 	return err
 }
 
 func (ce *connector) log(line string, args ...interface{}) {
 	if logger != nil {
-		output := fmt.Sprintf(line, args...)
-		output = fmt.Sprintf("[c%d] %s", ce.uid, output)
-		fmt.Fprintln(logger, "[StackServer]", output)
+		logger.Printf("[c%d] %s\n", ce.uid, fmt.Sprintf(line, args...))
 	}
 }
 
-type Connections struct {
+type connections struct {
 	mu      *sync.Mutex
 	head    *connector
 	tail    *connector
@@ -94,12 +89,12 @@ type Connections struct {
 	timeout time.Duration
 }
 
-func newConnections(max int, timeout time.Duration) *Connections {
+func newConnections(max int, timeout time.Duration) *connections {
 	// create dummy head and tail to simplify adding and removing
 	front, back := &connector{}, &connector{}
 	front.next, back.prev = back, front
 
-	return &Connections{
+	return &connections{
 		mu:      &sync.Mutex{},
 		head:    front,
 		tail:    back,
@@ -108,7 +103,7 @@ func newConnections(max int, timeout time.Duration) *Connections {
 	}
 }
 
-func (cs *Connections) add(conn net.Conn) (*connector, error) {
+func (cs *connections) add(conn net.Conn) (*connector, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -139,7 +134,7 @@ func (cs *Connections) add(conn net.Conn) (*connector, error) {
 	return newConn, nil
 }
 
-func (cs *Connections) remove(c *connector) error {
+func (cs *connections) remove(c *connector) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -154,26 +149,4 @@ func (cs *Connections) remove(c *connector) error {
 	}
 
 	return nil
-}
-
-func (cs *Connections) scanClosed() {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	one := []byte{0x00}
-	allClosed := []*connector{}
-	for c := cs.head.next; c != cs.tail; c = c.next {
-		if c.waiting {
-			allClosed = append(allClosed, c)
-		}
-	}
-
-	for _, c := range allClosed {
-		c.netConn.SetReadDeadline(time.Now().Add(time.Millisecond))
-		_, err := c.netConn.Read(one)
-		if err == io.EOF {
-			c.done <- true
-			c.log("Client closed")
-		}
-	}
 }
