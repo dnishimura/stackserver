@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -11,75 +10,9 @@ import (
 var connectionsMaxError = errors.New("Connections max reached")
 var connectionsEmptyError = errors.New("Connections empty")
 var connectionClosedError = errors.New("Connection closed")
-var counter uint64 = 1
 
-type request []byte
-
-func (r request) isPop() bool {
-	return (r[0] >> 7) == 1
-}
-
-func (r request) isPush() bool {
-	return (r[0] >> 7) == 0
-}
-
-type connector struct {
-	uid       uint64
-	netConn   net.Conn
-	next      *connector
-	prev      *connector
-	timestamp time.Time
-	done      chan bool
-}
-
-func (ce *connector) duration() time.Duration {
-	return time.Since(ce.timestamp)
-}
-
-func (ce *connector) read(data []byte) (int, error) {
-	if ce.netConn == nil {
-		return 0, nil
-	}
-
-	return ce.netConn.Read(data)
-}
-
-func (ce *connector) writeall(data []byte) (int, error) {
-	if ce.netConn == nil {
-		return 0, nil
-	}
-
-	nwrite := 0
-	var err error
-	for n := 0; nwrite < len(data); nwrite += n {
-		n, err = ce.netConn.Write(data)
-		if err != nil {
-			return nwrite, err
-		}
-	}
-
-	return nwrite, nil
-}
-
-func (ce *connector) finish() error {
-	var err error
-	ce.next.prev, ce.prev.next = ce.prev, ce.next
-	ce.prev, ce.next = nil, nil
-
-	if ce.netConn != nil {
-		err = ce.netConn.Close()
-	}
-	ce.done <- true // Ensure connection is closed
-
-	return err
-}
-
-func (ce *connector) log(line string, args ...interface{}) {
-	if logger != nil {
-		logger.Printf("[c%d] %s\n", ce.uid, fmt.Sprintf(line, args...))
-	}
-}
-
+// Connections keep a list of active client connections as connector instances.
+// Oldest is at the head of the list.
 type connections struct {
 	mu      *sync.Mutex
 	head    *connector
@@ -89,6 +22,9 @@ type connections struct {
 	timeout time.Duration
 }
 
+// Create a new connections list with max size and timeout duration
+// of before an connector can be removed if queue is full and there
+// is an incoming connection.
 func newConnections(max int, timeout time.Duration) *connections {
 	// create dummy head and tail to simplify adding and removing
 	front, back := &connector{}, &connector{}
@@ -103,6 +39,7 @@ func newConnections(max int, timeout time.Duration) *connections {
 	}
 }
 
+// Creates and adds a connector to the list from an active client connection.
 func (cs *connections) add(conn net.Conn) (*connector, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -118,7 +55,7 @@ func (cs *connections) add(conn net.Conn) (*connector, error) {
 		}
 	}
 
-	newConn := &connector{
+	cr := &connector{
 		uid:       counter,
 		netConn:   conn,
 		prev:      cs.tail.prev,
@@ -127,14 +64,15 @@ func (cs *connections) add(conn net.Conn) (*connector, error) {
 		done:      make(chan bool, 2),
 	}
 	counter++
-	cs.tail.prev.next = newConn
-	cs.tail.prev = newConn
+	cs.tail.prev.next = cr
+	cs.tail.prev = cr
 	cs.len++
 
-	return newConn, nil
+	return cr, nil
 }
 
-func (cs *connections) remove(c *connector) error {
+// Removes connector from list when client connection is done.
+func (cs *connections) remove(cr *connector) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -143,8 +81,8 @@ func (cs *connections) remove(c *connector) error {
 		return connectionsEmptyError
 	}
 
-	if c.prev != nil {
-		c.finish()
+	if cr.prev != nil {
+		cr.finish()
 		cs.len--
 	}
 

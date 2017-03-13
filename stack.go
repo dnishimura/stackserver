@@ -8,11 +8,13 @@ import (
 var stackEmptyError = errors.New("Stack is empty")
 var stackFullError = errors.New("Stack is full")
 
+// Payload stack item
 type payload struct {
 	data []byte
 	next *payload
 }
 
+// Simple mutex protected stack
 type stack struct {
 	mu  *sync.Mutex
 	top *payload
@@ -20,10 +22,12 @@ type stack struct {
 	len int
 }
 
-func newStack(maxLength int) *stack {
-	return &stack{mu: &sync.Mutex{}, max: maxLength}
+// Create a stack with a max size
+func newStack(maxSize int) *stack {
+	return &stack{mu: &sync.Mutex{}, max: maxSize}
 }
 
+// Push data on stack. Returns error if full.
 func (s *stack) push(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -38,6 +42,7 @@ func (s *stack) push(data []byte) error {
 	return nil
 }
 
+// Pop data off stack. Returns error if empty.
 func (s *stack) pop() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -16,6 +16,17 @@ const (
 
 var logger *log.Logger
 
+type request []byte
+
+func (r request) isPop() bool {
+	return (r[0] >> 7) == 1
+}
+
+func (r request) isPush() bool {
+	return (r[0] >> 7) == 0
+}
+
+// Server represents the stack server.
 type Server struct {
 	chans       chan bool
 	stack       *stack
@@ -23,6 +34,7 @@ type Server struct {
 	clientcount int64
 }
 
+// Creates new stack server.
 func New(maxConnections, stackSize int, timeout time.Duration) *Server {
 	return &Server{
 		chans:       make(chan bool, stackSize),
@@ -31,7 +43,9 @@ func New(maxConnections, stackSize int, timeout time.Duration) *Server {
 	}
 }
 
-func (server *Server) Start(host string, port, logport uint) error {
+// Starts stack server listening on host, TCP port.
+// Optionally, if logport is non-zero, logs will be sent to that port over UDP.
+func (server *Server) Start(host, loghost string, port, logport uint) error {
 	var err error
 	log.SetPrefix("[StackServer] ")
 	log.SetFlags(log.Lmicroseconds)
@@ -41,8 +55,8 @@ func (server *Server) Start(host string, port, logport uint) error {
 	if logport > 65535 {
 		log.Fatal("Invalid debug port", logport)
 	} else if logport > 0 {
-		syslogHost := fmt.Sprintf("%s:%d", host, logport)
-		udp, err := net.Dial("udp", syslogHost)
+		debugHost := fmt.Sprintf("%s:%d", loghost, logport)
+		udp, err := net.Dial("udp", debugHost)
 		logger = log.New(udp, "[StackServer] ", log.Lmicroseconds)
 		if err != nil {
 			log.Println("Debug logging disabled.", err)
@@ -74,6 +88,7 @@ func (server *Server) Start(host string, port, logport uint) error {
 	return nil
 }
 
+// Push request to a connector. Will block until stack is not full or client connection closes.
 func (server *Server) push(c *connector, data []byte) error {
 	select {
 	case server.chans <- true:
@@ -84,6 +99,7 @@ func (server *Server) push(c *connector, data []byte) error {
 	return connectionClosedError
 }
 
+// Pop request to a connector. Will block until stack is not empty or client connection closes.
 func (server *Server) pop(c *connector) ([]byte, error) {
 	select {
 	case <-server.chans:
@@ -94,6 +110,7 @@ func (server *Server) pop(c *connector) ([]byte, error) {
 	return nil, connectionClosedError
 }
 
+// Accept a client connection as a goroutine.
 func (server *Server) accept(c net.Conn) {
 	connector, err := server.connections.add(c)
 	if err == connectionsMaxError {
@@ -185,6 +202,7 @@ func (server *Server) accept(c net.Conn) {
 	server.connections.remove(connector)
 }
 
+// Log to UDP port if configured.
 func (server *Server) log(line string, args ...interface{}) {
 	if logger != nil {
 		logger.Println(fmt.Sprintf(line, args...))
